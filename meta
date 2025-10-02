@@ -1,0 +1,405 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+/*
+SocialAgentAdvanced
+
+* ProfileNFT: ERC721 profiles (mintable by users) with metadata pointer (IPFS/JSON)
+* SocialAgentAdvanced: uses profileTokenId to create posts, comments, likes, follows
+* EIP-712 meta-action example: createPostWithSig allows a user to sign a post off-chain and a relayer to submit on-chain
+* Admin moderation, reports, soft/hard delete
+* Gas-conscious: use calldata, small structs for hot paths, events for indexing
+* Requires OpenZeppelin contracts:
+  @openzeppelin/contracts/token/ERC721/ERC721.sol
+  @openzeppelin/contracts/access/Ownable.sol
+  @openzeppelin/contracts/utils/cryptography/ECDSA.sol
+  @openzeppelin/contracts/utils/Counters.sol
+  @openzeppelin/contracts/security/ReentrancyGuard.sol
+  */
+
+import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import "@openzeppelin/contracts/utils/Counters.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+/// @notice Minimal ERC721 for profiles. Metadata should be an IPFS JSON with username/bio/avatar.
+contract ProfileNFT is ERC721, Ownable {
+using Counters for Counters.Counter;
+Counters.Counter private _tokenIdTracker;
+
+```
+// tokenId => metadata URI (IPFS JSON)
+mapping(uint256 => string) public metadata;
+
+event ProfileMinted(address indexed owner, uint256 indexed tokenId, string metadataURI);
+event ProfileMetadataUpdated(uint256 indexed tokenId, string metadataURI);
+
+constructor(string memory name_, string memory symbol_) ERC721(name_, symbol_) {
+    // start token ids at 1 for zero-check convenience
+    _tokenIdTracker.increment();
+}
+
+/// @notice Mint your own profile NFT. metadataURI should point to a JSON with username, avatar, bio, etc.
+function mintProfile(string calldata metadataURI) external returns (uint256) {
+    uint256 tid = _tokenIdTracker.current();
+    _tokenIdTracker.increment();
+    _safeMint(msg.sender, tid);
+    metadata[tid] = metadataURI;
+    emit ProfileMinted(msg.sender, tid, metadataURI);
+    return tid;
+}
+
+/// @notice Owner of token can update its metadata pointer
+function updateMetadata(uint256 tokenId, string calldata metadataURI) external {
+    require(ownerOf(tokenId) == msg.sender, "not profile owner");
+    metadata[tokenId] = metadataURI;
+    emit ProfileMetadataUpdated(tokenId, metadataURI);
+}
+
+/// @notice Admin mint (optional for integrations)
+function adminMint(address to, string calldata metadataURI) external onlyOwner returns (uint256) {
+    uint256 tid = _tokenIdTracker.current();
+    _tokenIdTracker.increment();
+    _safeMint(to, tid);
+    metadata[tid] = metadataURI;
+    emit ProfileMinted(to, tid, metadataURI);
+    return tid;
+}
+```
+
+}
+
+/// @notice SocialAgentAdvanced - core social features
+contract SocialAgentAdvanced is Ownable, ReentrancyGuard {
+using Counters for Counters.Counter;
+using ECDSA for bytes32;
+
+```
+ProfileNFT public immutable profileNFT;
+
+constructor(address profileNftAddr) {
+    profileNFT = ProfileNFT(profileNftAddr);
+}
+
+// ---------------------
+// Events
+// ---------------------
+event PostCreated(uint256 indexed postId, uint256 indexed profileId, address indexed author, string contentURI, uint256 timestamp);
+event PostEdited(uint256 indexed postId, string newContentURI, uint256 timestamp);
+event PostSoftDeleted(uint256 indexed postId, address indexed by, uint256 timestamp);
+event PostHardDeleted(uint256 indexed postId, address indexed by, uint256 timestamp);
+
+event CommentCreated(uint256 indexed commentId, uint256 indexed postId, uint256 indexed profileId, string contentURI, uint256 timestamp);
+event Liked(uint256 indexed postId, uint256 indexed profileId, address indexed by, uint256 timestamp);
+event Unliked(uint256 indexed postId, uint256 indexed profileId, address indexed by, uint256 timestamp);
+
+event Followed(uint256 indexed followerProfileId, uint256 indexed followedProfileId, uint256 timestamp);
+event Unfollowed(uint256 indexed followerProfileId, uint256 indexed followedProfileId, uint256 timestamp);
+
+event ReportCreated(uint256 indexed reportId, uint256 indexed profileId, uint256 indexed postId, address reporter, string reason, uint256 timestamp);
+event ProfileBlocked(uint256 indexed profileId, uint256 timestamp);
+event ProfileUnblocked(uint256 indexed profileId, uint256 timestamp);
+
+// ---------------------
+// Storage
+// ---------------------
+struct Post {
+    uint256 id;
+    uint256 profileId;   // profileTokenId
+    string contentURI;   // IPFS/Arweave pointer
+    uint64 createdAt;
+    uint64 updatedAt;
+    bool deleted;        // soft delete
+    uint32 likeCount;
+}
+
+struct Comment {
+    uint256 id;
+    uint256 postId;
+    uint256 profileId;
+    string contentURI;
+    uint64 createdAt;
+}
+
+Counters.Counter private _postIdTracker;
+Counters.Counter private _commentIdTracker;
+Counters.Counter private _reportIdTracker;
+
+mapping(uint256 => Post) public posts; // postId => Post
+mapping(uint256 => uint256[]) private _postsByProfile; // profileId => postIds
+mapping(uint256 => Comment) public comments; // commentId => Comment
+mapping(uint256 => uint256[]) private _commentsByPost; // postId => commentIds
+
+// likes: postId => profileId => bool (profile likes a post)
+mapping(uint256 => mapping(uint256 => bool)) public postLikedByProfile;
+
+// follows: followerProfileId => followedProfileId => bool
+mapping(uint256 => mapping(uint256 => bool)) public follows;
+
+// blocked profiles: profileId => bool
+mapping(uint256 => bool) public blockedProfile;
+
+struct Report {
+    uint256 id;
+    uint256 profileId; // reported profile
+    uint256 postId;    // optional
+    address reporter;
+    string reason;
+    uint64 ts;
+}
+mapping(uint256 => Report) public reports;
+
+// ---------------------
+// Meta-tx / EIP-712 (simplified)
+// ---------------------
+bytes32 public DOMAIN_SEPARATOR;
+// keccak256("CreatePost(uint256 profileId,string contentURI,uint256 nonce,uint256 deadline)")
+bytes32 public constant CREATE_POST_TYPEHASH = keccak256("CreatePost(uint256 profileId,string contentURI,uint256 nonce,uint256 deadline)");
+mapping(address => uint256) public nonces;
+
+// ---------------------
+// Modifiers & helpers
+// ---------------------
+modifier onlyProfileOwner(uint256 profileId) {
+    require(profileNFT.ownerOf(profileId) == msg.sender, "not profile owner");
+    require(!blockedProfile[profileId], "profile blocked");
+    _;
+}
+
+function _now() internal view returns (uint64) {
+    return uint64(block.timestamp);
+}
+
+// ---------------------
+// EIP-712 Setup
+// ---------------------
+function initDomain(string calldata name, string calldata version) external onlyOwner {
+    uint256 chainId;
+    assembly { chainId := chainid() }
+    DOMAIN_SEPARATOR = keccak256(
+        abi.encode(
+            keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+            keccak256(bytes(name)),
+            keccak256(bytes(version)),
+            chainId,
+            address(this)
+        )
+    );
+}
+
+// ---------------------
+// Posts
+// ---------------------
+function createPost(uint256 profileId, string calldata contentURI) external nonReentrant onlyProfileOwner(profileId) returns (uint256) {
+    uint256 pid = _postIdTracker.current();
+    _postIdTracker.increment();
+
+    posts[pid] = Post({
+        id: pid,
+        profileId: profileId,
+        contentURI: contentURI,
+        createdAt: _now(),
+        updatedAt: _now(),
+        deleted: false,
+        likeCount: 0
+    });
+
+    _postsByProfile[profileId].push(pid);
+
+    emit PostCreated(pid, profileId, msg.sender, contentURI, block.timestamp);
+    return pid;
+}
+
+/// @notice Create post on behalf of signer using EIP-712 signature (meta-tx)
+function createPostWithSig(
+    uint256 profileId,
+    string calldata contentURI,
+    uint256 nonce,
+    uint256 deadline,
+    bytes calldata signature
+) external nonReentrant returns (uint256) {
+    require(block.timestamp <= deadline, "signature expired");
+    // reconstruct digest
+    bytes32 structHash = keccak256(abi.encode(
+        CREATE_POST_TYPEHASH,
+        profileId,
+        keccak256(bytes(contentURI)),
+        nonce,
+        deadline
+    ));
+    bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
+    address signer = digest.recover(signature);
+    require(signer != address(0), "invalid signature");
+    require(nonces[signer] == nonce, "nonce mismatch");
+    nonces[signer] = nonce + 1;
+
+    // signer must own profileId
+    require(profileNFT.ownerOf(profileId) == signer, "signer not profile owner");
+    require(!blockedProfile[profileId], "profile blocked");
+
+    uint256 pid = _postIdTracker.current();
+    _postIdTracker.increment();
+
+    posts[pid] = Post({
+        id: pid,
+        profileId: profileId,
+        contentURI: contentURI,
+        createdAt: _now(),
+        updatedAt: _now(),
+        deleted: false,
+        likeCount: 0
+    });
+
+    _postsByProfile[profileId].push(pid);
+
+    emit PostCreated(pid, profileId, signer, contentURI, block.timestamp);
+    return pid;
+}
+
+function editPost(uint256 postId, string calldata newContentURI) external {
+    Post storage p = posts[postId];
+    require(p.id != 0 && !p.deleted, "post missing");
+    require(profileNFT.ownerOf(p.profileId) == msg.sender, "not author");
+    p.contentURI = newContentURI;
+    p.updatedAt = _now();
+    emit PostEdited(postId, newContentURI, block.timestamp);
+}
+
+function softDeletePost(uint256 postId) external {
+    Post storage p = posts[postId];
+    require(p.id != 0 && !p.deleted, "post missing");
+    address owner = profileNFT.ownerOf(p.profileId);
+    require(msg.sender == owner || msg.sender == owner() /* contract owner */ , "not allowed");
+    p.deleted = true;
+    emit PostSoftDeleted(postId, msg.sender, block.timestamp);
+}
+
+function hardDeletePost(uint256 postId) external onlyOwner {
+    Post storage p = posts[postId];
+    require(p.id != 0, "post missing");
+    // remove storage to save space (note: cannot remove from arrays cheaply)
+    delete posts[postId];
+    emit PostHardDeleted(postId, msg.sender, block.timestamp);
+}
+
+// ---------------------
+// Comments
+// ---------------------
+function createComment(uint256 profileId, uint256 postId, string calldata contentURI) external nonReentrant onlyProfileOwner(profileId) returns (uint256) {
+    require(posts[postId].id != 0 && !posts[postId].deleted, "post missing");
+    uint256 cid = _commentIdTracker.current();
+    _commentIdTracker.increment();
+    comments[cid] = Comment({
+        id: cid,
+        postId: postId,
+        profileId: profileId,
+        contentURI: contentURI,
+        createdAt: _now()
+    });
+    _commentsByPost[postId].push(cid);
+    emit CommentCreated(cid, postId, profileId, contentURI, block.timestamp);
+    return cid;
+}
+
+// ---------------------
+// Likes
+// ---------------------
+function likePost(uint256 profileId, uint256 postId) external nonReentrant onlyProfileOwner(profileId) {
+    Post storage p = posts[postId];
+    require(p.id != 0 && !p.deleted, "post missing");
+    require(!postLikedByProfile[postId][profileId], "already liked");
+    postLikedByProfile[postId][profileId] = true;
+    // safe cast - likes unlikely to overflow uint32
+    p.likeCount += 1;
+    emit Liked(postId, profileId, msg.sender, block.timestamp);
+}
+
+function unlikePost(uint256 profileId, uint256 postId) external nonReentrant onlyProfileOwner(profileId) {
+    Post storage p = posts[postId];
+    require(p.id != 0 && !p.deleted, "post missing");
+    require(postLikedByProfile[postId][profileId], "not liked");
+    postLikedByProfile[postId][profileId] = false;
+    // guard not negative
+    if (p.likeCount > 0) p.likeCount -= 1;
+    emit Unliked(postId, profileId, msg.sender, block.timestamp);
+}
+
+// ---------------------
+// Follow/unfollow
+// ---------------------
+function follow(uint256 followerProfileId, uint256 followedProfileId) external nonReentrant onlyProfileOwner(followerProfileId) {
+    require(profileNFT.ownerOf(followedProfileId) != address(0), "followed missing");
+    require(followerProfileId != followedProfileId, "self follow");
+    require(!follows[followerProfileId][followedProfileId], "already follow");
+    follows[followerProfileId][followedProfileId] = true;
+    emit Followed(followerProfileId, followedProfileId, block.timestamp);
+}
+
+function unfollow(uint256 followerProfileId, uint256 followedProfileId) external nonReentrant onlyProfileOwner(followerProfileId) {
+    require(follows[followerProfileId][followedProfileId], "not following");
+    follows[followerProfileId][followedProfileId] = false;
+    emit Unfollowed(followerProfileId, followedProfileId, block.timestamp);
+}
+
+// ---------------------
+// Reporting & moderation
+// ---------------------
+function report(uint256 profileId, uint256 postId, string calldata reason) external returns (uint256) {
+    uint256 rid = _reportIdTracker.current();
+    _reportIdTracker.increment();
+    reports[rid] = Report({
+        id: rid,
+        profileId: profileId,
+        postId: postId,
+        reporter: msg.sender,
+        reason: reason,
+        ts: _now()
+    });
+    emit ReportCreated(rid, profileId, postId, msg.sender, reason, block.timestamp);
+    return rid;
+}
+
+function blockProfile(uint256 profileId) external onlyOwner {
+    blockedProfile[profileId] = true;
+    emit ProfileBlocked(profileId, block.timestamp);
+}
+
+function unblockProfile(uint256 profileId) external onlyOwner {
+    blockedProfile[profileId] = false;
+    emit ProfileUnblocked(profileId, block.timestamp);
+}
+
+// ---------------------
+// Views & pagination helpers (gas-free reads)
+// ---------------------
+function getPostsByProfile(uint256 profileId) external view returns (uint256[] memory) {
+    return _postsByProfile[profileId];
+}
+
+function getCommentsByPost(uint256 postId) external view returns (uint256[] memory) {
+    return _commentsByPost[postId];
+}
+
+function isFollowing(uint256 followerProfileId, uint256 followedProfileId) external view returns (bool) {
+    return follows[followerProfileId][followedProfileId];
+}
+
+function hasLiked(uint256 postId, uint256 profileId) external view returns (bool) {
+    return postLikedByProfile[postId][profileId];
+}
+
+// ---------------------
+// Emergency funds receiver & admin withdraw
+// ---------------------
+receive() external payable {}
+fallback() external payable {}
+
+function adminWithdraw(address payable to, uint256 amount) external onlyOwner {
+    require(to != address(0), "zero");
+    (bool ok,) = to.call{value: amount}("");
+    require(ok, "transfer failed");
+}
+```
+
+}
