@@ -1,0 +1,70 @@
+/*
+React example (snippet) — shows signer creating EIP-712 signature for createPostWithSig,
+then posting signature to a relayer endpoint (e.g., your server) which will call on-chain.
+
+This is illustrative; wire up your relayer backend to accept the JSON and call social.createPostWithSig(...).
+*/
+import React, { useState } from "react";
+import { ethers } from "ethers";
+
+export default function CreatePostMetaTx({ contractAddress, chainId }) {
+const [contentURI, setContentURI] = useState("");
+const [profileId, setProfileId] = useState("");
+const [deadline, setDeadline] = useState(Math.floor(Date.now() / 1000) + 3600);
+
+async function signAndSend() {
+if (!window.ethereum) return alert("Install MetaMask");
+const provider = new ethers.providers.Web3Provider(window.ethereum);
+await provider.send("eth_requestAccounts", []);
+const signer = provider.getSigner();
+
+```
+const domain = {
+  name: "SocialAgent",
+  version: "1",
+  chainId: chainId,
+  verifyingContract: contractAddress
+};
+
+const types = {
+  CreatePost: [
+    { name: "profileId", type: "uint256" },
+    { name: "contentURI", type: "string" },
+    { name: "nonce", type: "uint256" },
+    { name: "deadline", type: "uint256" }
+  ]
+};
+
+// fetch nonce from contract (nonces[signerAddress])
+const contract = new ethers.Contract(contractAddress, [
+  "function nonces(address) view returns (uint256)"
+], provider);
+const signerAddr = await signer.getAddress();
+const nonce = (await contract.nonces(signerAddr)).toNumber();
+
+const value = {
+  profileId: parseInt(profileId),
+  contentURI: contentURI,
+  nonce: nonce,
+  deadline: deadline
+};
+
+const signature = await signer._signTypedData(domain, types, value);
+
+// send to your relayer API which will call createPostWithSig(profileId, contentURI, nonce, deadline, signature)
+await fetch("/api/relayer/createPost", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ profileId, contentURI, nonce, deadline, signature })
+});
+
+alert("Signature sent to relayer");
+```
+
+}
+
+return ( <div>
+<input placeholder="profile id" value={profileId} onChange={(e) => setProfileId(e.target.value)} />
+<input placeholder="ipfs://post.json" value={contentURI} onChange={(e) => setContentURI(e.target.value)} /> <button onClick={signAndSend}>Sign & send to relayer</button> </div>
+);
+}
