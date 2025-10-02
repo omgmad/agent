@@ -1,0 +1,55 @@
+/*
+Ethers.js helper to create an EIP-712 signature for createPostWithSig.
+Example usage (node):
+node scripts/signCreatePost.js <PRIVATE_KEY> <CONTRACT_ADDRESS> <CHAIN_ID> <PROFILE_ID> "<CONTENT_URI>" <NONCE> <DEADLINE>
+
+This outputs the signature which a relayer can submit to createPostWithSig.
+*/
+const { ethers } = require("ethers");
+
+async function main() {
+const args = process.argv.slice(2);
+if (args.length < 7) {
+console.error("Usage: node signCreatePost.js <PK> <CONTRACT> <CHAIN_ID> <PROFILE_ID> <CONTENT_URI> <NONCE> <DEADLINE>");
+process.exit(1);
+}
+const [pk, contractAddress, chainIdStr, profileIdStr, contentURI, nonceStr, deadlineStr] = args;
+const chainId = parseInt(chainIdStr);
+const profileId = parseInt(profileIdStr);
+const nonce = parseInt(nonceStr);
+const deadline = parseInt(deadlineStr);
+
+const wallet = new ethers.Wallet(pk);
+// EIP-712 domain must match initDomain("SocialAgent", "1") on-chain
+const domain = {
+name: "SocialAgent",
+version: "1",
+chainId: chainId,
+verifyingContract: contractAddress
+};
+
+const types = {
+CreatePost: [
+{ name: "profileId", type: "uint256" },
+{ name: "contentURI", type: "string" },
+{ name: "nonce", type: "uint256" },
+{ name: "deadline", type: "uint256" }
+]
+};
+
+const value = {
+profileId: profileId,
+contentURI: contentURI,
+nonce: nonce,
+deadline: deadline
+};
+
+// sign typed data
+const signature = await wallet._signTypedData(domain, types, value);
+console.log("signature:", signature);
+console.log("components (r, s, v):", ethers.utils.splitSignature(signature));
+}
+
+if (require.main === module) {
+main();
+}
