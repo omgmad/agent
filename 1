@@ -1,0 +1,36 @@
+/*
+Hardhat deploy script (deploy.js)
+Usage:
+npx hardhat run --network <network> scripts/deploy.js
+
+Assumes contracts ProfileNFT and SocialAgentAdvanced exist and are compiled.
+*/
+async function main() {
+const [deployer] = await ethers.getSigners();
+console.log("Deploying with:", deployer.address);
+
+const ProfileNFT = await ethers.getContractFactory("ProfileNFT");
+const profile = await ProfileNFT.deploy("SocialProfile", "SP");
+await profile.deployed();
+console.log("ProfileNFT deployed to:", profile.address);
+
+const Social = await ethers.getContractFactory("SocialAgentAdvanced");
+const social = await Social.deploy(profile.address);
+await social.deployed();
+console.log("SocialAgentAdvanced deployed to:", social.address);
+
+// initialize EIP-712 domain (name, version)
+const tx = await social.initDomain("SocialAgent", "1");
+await tx.wait();
+console.log("Initialized EIP-712 domain");
+
+// (optional) transfer ownership of ProfileNFT to deployer already owner; can set admin etc.
+console.log("Done. Contracts ready.");
+}
+
+main()
+.then(() => process.exit(0))
+.catch((err) => {
+console.error(err);
+process.exit(1);
+});
