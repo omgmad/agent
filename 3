@@ -1,0 +1,109 @@
+/*
+Hardhat test (mocha + chai + ethers)
+Covers:
+
+* mint profile
+* create on-chain post
+* EIP-712 meta-tx createPostWithSig flow
+* like/unlike
+
+Run:
+npx hardhat test test/social.test.js
+*/
+const { expect } = require("chai");
+const { ethers } = require("hardhat");
+
+describe("Social stack basic flows", function () {
+let deployer, user, relayer;
+let Profile, Social;
+let profile, social;
+
+beforeEach(async () => {
+[deployer, user, relayer] = await ethers.getSigners();
+Profile = await ethers.getContractFactory("ProfileNFT");
+Social = await ethers.getContractFactory("SocialAgentAdvanced");
+
+```
+profile = await Profile.deploy("TestProfile", "TP");
+await profile.deployed();
+
+social = await Social.deploy(profile.address);
+await social.deployed();
+
+// init EIP-712 domain matching signer helper
+await social.connect(deployer).initDomain("SocialAgent", "1");
+```
+
+});
+
+it("mint profile, create post on-chain, like", async () => {
+// user mints profile
+const metadata = "ipfs://profile/user1.json";
+await profile.connect(user).mintProfile(metadata);
+const tokenId = 1;
+expect(await profile.ownerOf(tokenId)).to.equal(user.address);
+
+```
+// create a post (on-chain)
+const content = "ipfs://post/post1.json";
+await social.connect(user).createPost(tokenId, content);
+const postId = 1;
+const p = await social.posts(postId);
+expect(p.profileId).to.equal(tokenId);
+expect(p.contentURI).to.equal(content);
+
+// like post (token owner must call like as their profile)
+await social.connect(user).likePost(tokenId, postId);
+const liked = await social.hasLiked(postId, tokenId);
+expect(liked).to.equal(true);
+
+// unlike
+await social.connect(user).unlikePost(tokenId, postId);
+expect(await social.hasLiked(postId, tokenId)).to.equal(false);
+```
+
+});
+
+it("meta-tx createPostWithSig via relayer", async () => {
+// user mints profile
+await profile.connect(user).mintProfile("ipfs://profile/u2.json");
+const profileId = 1;
+
+```
+// build EIP-712 signature
+const domain = {
+  name: "SocialAgent",
+  version: "1",
+  chainId: (await ethers.provider.getNetwork()).chainId,
+  verifyingContract: social.address
+};
+const types = {
+  CreatePost: [
+    { name: "profileId", type: "uint256" },
+    { name: "contentURI", type: "string" },
+    { name: "nonce", type: "uint256" },
+    { name: "deadline", type: "uint256" }
+  ]
+};
+const nonce = 0;
+const deadline = Math.floor(Date.now() / 1000) + 3600;
+const content = "ipfs://meta/post1.json";
+
+// sign using user (ethers signer)
+const signature = await user._signTypedData(domain, types, {
+  profileId: profileId,
+  contentURI: content,
+  nonce: nonce,
+  deadline: deadline
+});
+
+// relayer (different signer) calls createPostWithSig
+await social.connect(relayer).createPostWithSig(profileId, content, nonce, deadline, signature);
+
+const postId = 1;
+const p = await social.posts(postId);
+expect(p.contentURI).to.equal(content);
+```
+
+});
+});
