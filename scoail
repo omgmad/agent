@@ -1,0 +1,311 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+/*
+SocialAgent - a lightweight on-chain social contract example.
+Features:
+
+* Create and edit profiles (username, bio, avatar/content pointers stored off-chain e.g., IPFS)
+* Create posts (store content hash / pointer), edit/delete by author
+* Like posts
+* Follow / unfollow other profiles
+* Tip profile owners with ETH
+* Basic moderation: reports & admin removal of posts or blocking users
+* Events for off-chain indexing
+
+Notes:
+
+* Keep content pointers small (IPFS CID, Arweave tx id, or short text)
+* On-chain storage is limited and expensive; store large media off-chain
+* This is a simple, non-upgradeable example. For production consider OpenZeppelin libraries,
+  more granular access control, pausability, rate-limits, and gas optimization.
+  */
+
+contract SocialAgent {
+// --- Ownership / Admin ---
+address public admin;
+event AdminTransferred(address indexed oldAdmin, address indexed newAdmin);
+
+```
+modifier onlyAdmin() {
+    require(msg.sender == admin, "Only admin");
+    _;
+}
+
+constructor() {
+    admin = msg.sender;
+}
+
+function transferAdmin(address newAdmin) external onlyAdmin {
+    require(newAdmin != address(0), "zero addr");
+    emit AdminTransferred(admin, newAdmin);
+    admin = newAdmin;
+}
+
+// --- Profile ---
+struct Profile {
+    address owner;
+    string username;     // short, unique ideally (not enforced on-chain here)
+    string bio;          // off-chain pointer or short text
+    string avatar;       // IPFS/URL pointer
+    uint256 createdAt;
+    uint256 updatedAt;
+    bool exists;
+}
+
+// profileId => Profile
+mapping(uint256 => Profile) public profiles;
+// owner address => profileId (0 means none)
+mapping(address => uint256) public ownerToProfile;
+// incrementing profile id
+uint256 private _nextProfileId = 1;
+
+event ProfileCreated(uint256 indexed profileId, address indexed owner, string username);
+event ProfileUpdated(uint256 indexed profileId);
+event ProfileDeleted(uint256 indexed profileId);
+
+function createProfile(string calldata username, string calldata bio, string calldata avatar) external returns (uint256) {
+    require(ownerToProfile[msg.sender] == 0, "profile exists");
+    uint256 pid = _nextProfileId++;
+    profiles[pid] = Profile({
+        owner: msg.sender,
+        username: username,
+        bio: bio,
+        avatar: avatar,
+        createdAt: block.timestamp,
+        updatedAt: block.timestamp,
+        exists: true
+    });
+    ownerToProfile[msg.sender] = pid;
+    emit ProfileCreated(pid, msg.sender, username);
+    return pid;
+}
+
+function editProfile(uint256 profileId, string calldata username, string calldata bio, string calldata avatar) external {
+    Profile storage p = profiles[profileId];
+    require(p.exists, "no profile");
+    require(p.owner == msg.sender, "not owner");
+    p.username = username;
+    p.bio = bio;
+    p.avatar = avatar;
+    p.updatedAt = block.timestamp;
+    emit ProfileUpdated(profileId);
+}
+
+function deleteProfile(uint256 profileId) external {
+    Profile storage p = profiles[profileId];
+    require(p.exists, "no profile");
+    require(p.owner == msg.sender || msg.sender == admin, "not permitted");
+    ownerToProfile[p.owner] = 0;
+    delete profiles[profileId];
+    emit ProfileDeleted(profileId);
+}
+
+// --- Posts ---
+struct Post {
+    uint256 id;
+    uint256 profileId;   // who posted
+    string content;      // IPFS hash or short text
+    uint256 createdAt;
+    uint256 updatedAt;
+    bool exists;
+    bool deleted;
+    uint256 likeCount;
+}
+
+uint256 private _nextPostId = 1;
+mapping(uint256 => Post) public posts;           // postId => Post
+mapping(uint256 => uint256[]) public postsByProfile; // profileId => postIds
+
+// track likes: postId => liker => bool
+mapping(uint256 => mapping(address => bool)) public liked;
+// follower mapping: followerProfileId => followedProfileId => bool
+mapping(uint256 => mapping(uint256 => bool)) public follows;
+
+event PostCreated(uint256 indexed postId, uint256 indexed profileId, string content);
+event PostEdited(uint256 indexed postId);
+event PostDeleted(uint256 indexed postId, bool byAdmin);
+event PostLiked(uint256 indexed postId, address indexed liker);
+event PostUnliked(uint256 indexed postId, address indexed liker);
+event Followed(uint256 indexed follower, uint256 indexed followed);
+event Unfollowed(uint256 indexed follower, uint256 indexed followed);
+
+function createPost(uint256 profileId, string calldata content) external returns (uint256) {
+    Profile storage p = profiles[profileId];
+    require(p.exists, "profile not exists");
+    require(p.owner == msg.sender, "not profile owner");
+    uint256 pid = _nextPostId++;
+    posts[pid] = Post({
+        id: pid,
+        profileId: profileId,
+        content: content,
+        createdAt: block.timestamp,
+        updatedAt: block.timestamp,
+        exists: true,
+        deleted: false,
+        likeCount: 0
+    });
+    postsByProfile[profileId].push(pid);
+    emit PostCreated(pid, profileId, content);
+    return pid;
+}
+
+function editPost(uint256 postId, string calldata newContent) external {
+    Post storage post = posts[postId];
+    require(post.exists && !post.deleted, "no post");
+    Profile storage p = profiles[post.profileId];
+    require(p.owner == msg.sender, "not author");
+    post.content = newContent;
+    post.updatedAt = block.timestamp;
+    emit PostEdited(postId);
+}
+
+function deletePost(uint256 postId) external {
+    Post storage post = posts[postId];
+    require(post.exists && !post.deleted, "no post");
+    Profile storage p = profiles[post.profileId];
+    require(p.owner == msg.sender || msg.sender == admin, "not permitted");
+    post.deleted = true;
+    emit PostDeleted(postId, msg.sender == admin);
+}
+
+// Admin can immediately remove a post (hard delete)
+function adminRemovePost(uint256 postId) external onlyAdmin {
+    Post storage post = posts[postId];
+    require(post.exists, "no post");
+    post.deleted = true;
+    emit PostDeleted(postId, true);
+}
+
+// Likes
+function likePost(uint256 postId) external {
+    Post storage post = posts[postId];
+    require(post.exists && !post.deleted, "no post");
+    require(!liked[postId][msg.sender], "already liked");
+    liked[postId][msg.sender] = true;
+    post.likeCount += 1;
+    emit PostLiked(postId, msg.sender);
+}
+
+function unlikePost(uint256 postId) external {
+    Post storage post = posts[postId];
+    require(post.exists && !post.deleted, "no post");
+    require(liked[postId][msg.sender], "not liked");
+    liked[postId][msg.sender] = false;
+    // safe underflow not possible in ^0.8
+    post.likeCount -= 1;
+    emit PostUnliked(postId, msg.sender);
+}
+
+// --- Follow / Unfollow ---
+function follow(uint256 followerProfileId, uint256 followedProfileId) external {
+    // msg.sender must be owner of followerProfileId
+    require(profiles[followerProfileId].exists, "follower profile no exist");
+    require(profiles[followedProfileId].exists, "followed profile no exist");
+    require(profiles[followerProfileId].owner == msg.sender, "not owner of follower profile");
+    require(followerProfileId != followedProfileId, "can't follow self");
+    require(!follows[followerProfileId][followedProfileId], "already follow");
+    follows[followerProfileId][followedProfileId] = true;
+    emit Followed(followerProfileId, followedProfileId);
+}
+
+function unfollow(uint256 followerProfileId, uint256 followedProfileId) external {
+    require(profiles[followerProfileId].exists, "follower profile no exist");
+    require(profiles[followedProfileId].exists, "followed profile no exist");
+    require(profiles[followerProfileId].owner == msg.sender, "not owner of follower profile");
+    require(follows[followerProfileId][followedProfileId], "not following");
+    follows[followerProfileId][followedProfileId] = false;
+    emit Unfollowed(followerProfileId, followedProfileId);
+}
+
+// --- Tipping (ETH) ---
+// Anyone can tip a profile owner. Tips are forwarded to profile owner immediately.
+event TipSent(uint256 indexed profileId, address indexed from, uint256 amount);
+
+function tipProfile(uint256 profileId) external payable {
+    Profile storage p = profiles[profileId];
+    require(p.exists, "profile not exists");
+    require(msg.value > 0, "no tip");
+    // Forward ETH to profile owner. Use call to avoid gas limit issues.
+    (bool sent,) = p.owner.call{value: msg.value}("");
+    require(sent, "transfer failed");
+    emit TipSent(profileId, msg.sender, msg.value);
+}
+
+// --- Reporting & Moderation ---
+struct Report {
+    uint256 id;
+    address reporter;
+    uint256 postId;    // can be zero if reporting profile
+    uint256 profileId; // reported profile
+    string reason;     // short text or pointer
+    uint256 timestamp;
+}
+
+uint256 private _nextReportId = 1;
+mapping(uint256 => Report) public reports;
+
+event ReportCreated(uint256 indexed reportId, address indexed reporter, uint256 indexed profileId, uint256 postId, string reason);
+event UserBlocked(uint256 indexed profileId);
+event UserUnblocked(uint256 indexed profileId);
+
+// create report about a post or profile
+function report(uint256 profileId, uint256 postId, string calldata reason) external returns (uint256) {
+    require(profiles[profileId].exists, "profile not exists");
+    uint256 rid = _nextReportId++;
+    reports[rid] = Report({
+        id: rid,
+        reporter: msg.sender,
+        postId: postId,
+        profileId: profileId,
+        reason: reason,
+        timestamp: block.timestamp
+    });
+    emit ReportCreated(rid, msg.sender, profileId, postId, reason);
+    return rid;
+}
+
+// Admin can block/unblock a profile (blocking prevents posting/liking/following)
+mapping(uint256 => bool) public blockedProfile;
+
+function blockProfile(uint256 profileId) external onlyAdmin {
+    require(profiles[profileId].exists, "profile not exists");
+    blockedProfile[profileId] = true;
+    emit UserBlocked(profileId);
+}
+
+function unblockProfile(uint256 profileId) external onlyAdmin {
+    require(profiles[profileId].exists, "profile not exists");
+    blockedProfile[profileId] = false;
+    emit UserUnblocked(profileId);
+}
+
+// --- View helpers ---
+
+function getPostsByProfile(uint256 profileId) external view returns (uint256[] memory) {
+    return postsByProfile[profileId];
+}
+
+function isFollowing(uint256 followerProfileId, uint256 followedProfileId) external view returns (bool) {
+    return follows[followerProfileId][followedProfileId];
+}
+
+function hasLiked(uint256 postId, address user) external view returns (bool) {
+    return liked[postId][user];
+}
+
+// --- Fallbacks & Withdraw ---
+// Contract should never hold ETH long-term; tipping forwards immediately.
+// But in case ETH is sent directly, allow admin to withdraw.
+receive() external payable {}
+fallback() external payable {}
+
+function withdraw(address payable to, uint256 amount) external onlyAdmin {
+    require(to != address(0), "zero addr");
+    require(amount <= address(this).balance, "insufficient balance");
+    (bool sent,) = to.call{value: amount}("");
+    require(sent, "withdraw failed");
+}
+```
+
+}
